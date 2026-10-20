@@ -18,6 +18,18 @@ constexpr int OUTPUT_FAILSAFE[NUM_OUTPUTS] = {
 // and change HardwareTimer targets below if the timers change
 constexpr PinName OUTPUT_PINS[NUM_OUTPUTS] = { OUTPUT_PIN_MAP };
 
+// Standard PWM outputs: list output indices (0-based) that output standard duty-cycle PWM
+// instead of RC servo PWM. e.g. { 4, 5 } means output 5 and 6 use standard PWM
+// WARNING: All channels on the same hardware timer share the same frequency!
+// BluePill timer groups: TIM2={0,1,2,3}, TIM3={4,5,6,7}
+// If you mix modes within a timer group, the last pwm_start() call wins and
+// all channels on that timer will use that frequency.
+// Safe:  { 0,1,2,3 } or { 4,5,6,7 } (entire timer group)
+// UNSAFE: { 0,4 } or { 3,4 } (mixes 50Hz and 1kHz on same timer)
+constexpr unsigned int STANDARD_PWM_OUTPUTS[] = { 4, 5, 6, 7 };
+constexpr unsigned int NUM_STANDARD_PWM_OUTPUTS = sizeof(STANDARD_PWM_OUTPUTS) / sizeof(STANDARD_PWM_OUTPUTS[0]);
+#define STANDARD_PWM_FREQ_HZ  1000
+
 #define PWM_FREQ_HZ     50
 #define VBAT_INTERVAL   500
 #define VBAT_SMOOTH     5
@@ -52,6 +64,19 @@ static struct tagConnectionState {
     bool serialEcho;
 } g_State;
 
+static bool isStandardPwm(unsigned int servo)
+{
+    for (unsigned int i = 0; i < NUM_STANDARD_PWM_OUTPUTS; ++i)
+        if (STANDARD_PWM_OUTPUTS[i] == servo)
+            return true;
+    return false;
+}
+
+static int usToDutyPercent(int us)
+{
+    return map(us, CRSF_ELIMIT_US_MIN, CRSF_ELIMIT_US_MAX, 0, 100);
+}
+
 static void crsfOobData(uint8_t b)
 {
     // A shifty byte is usually just log messages from ELRS
@@ -81,7 +106,10 @@ static void servoPlatformBegin(unsigned int servo)
 static void servoPlatformSet(unsigned int servo, int usec)
 {
 #if defined(ARDUINO_ARCH_STM32)
-    pwm_start(OUTPUT_PINS[servo], PWM_FREQ_HZ, usec, MICROSEC_COMPARE_FORMAT);
+    if (isStandardPwm(servo))
+        pwm_start(OUTPUT_PINS[servo], STANDARD_PWM_FREQ_HZ, usec, PERCENT_COMPARE_FORMAT);
+    else
+        pwm_start(OUTPUT_PINS[servo], PWM_FREQ_HZ, usec, MICROSEC_COMPARE_FORMAT);
 #endif
 #if defined(TARGET_RASPBERRY_PI_PICO)
     if (g_Servos[servo] == nullptr)
@@ -132,11 +160,39 @@ static void outputFailsafeValues()
     for (unsigned int out=0; out<NUM_OUTPUTS; ++out)
     {
         if (OUTPUT_FAILSAFE[out] == fsaNoPulses)
+        {
             servoSetUs(out, 0);
+            
+            Serial.write(out < 10 ? '0' + out : 'A' + out - 10);
+            Serial.write('=');
+            Serial.write("fsaNoPulses");
+            Serial.write(' ');
+
+        }
         else if (OUTPUT_FAILSAFE[out] != fsaHold)
-            servoSetUs(out, OUTPUT_FAILSAFE[out]);
-        // else fsaHold does nothing, keep the same value
+        {
+            int val = OUTPUT_FAILSAFE[out];
+            if (isStandardPwm(out))
+                val = usToDutyPercent(val);
+            servoSetUs(out, val);
+
+            Serial.write(out < 10 ? '0' + out : 'A' + out - 10);
+            Serial.write('=');
+            Serial.print(val, DEC);
+            Serial.write(' ');
+
+        }
+        else
+        {
+            // fsaHold does nothing, keep the same value
+            Serial.write(out < 10 ? '0' + out : 'A' + out - 10);
+            Serial.write('=');
+            Serial.write("fsaHold");
+            Serial.write(' ');
+        }
     }
+    
+    Serial.println();
 }
 
 
@@ -189,17 +245,19 @@ static void packetChannels()
             // (1500 - usOutput) + 1500
             usOutput = 3000 - usOutput;
         }
+        if (isStandardPwm(out))
+            usOutput = usToDutyPercent(usOutput);
         servoSetUs(out, usOutput);
+
+        Serial.write(chInput < 10 ? '0' + chInput : 'A' + chInput - 10);
+        Serial.write('=');
+        Serial.print(usOutput, DEC);
+        Serial.write(' ');
+
     }
 
-    // for (unsigned int ch=1; ch<=4; ++ch)
-    // {
-    //     Serial.write(ch < 10 ? '0' + ch : 'A' + ch - 10);
-    //     Serial.write('=');
-    //     Serial.print(crsf.getChannel(ch), DEC);
-    //     Serial.write(' ');
-    // }
-    // Serial.println();
+    Serial.println();
+
 }
 
 static void packetLinkStatistics(crsfLinkStatistics_t *link)
@@ -239,8 +297,8 @@ static void checkVbatt()
     crsfbatt.voltage = htobe16(scaledVoltage);
     crsf.queuePacket(CRSF_FRAMETYPE_BATTERY_SENSOR, &crsfbatt, sizeof(crsfbatt));
 
-    //Serial.print("ADC="); Serial.print(adc, DEC);
-    //Serial.print(" "); Serial.print(g_State.vbatValue, DEC); Serial.println("V");
+    Serial.print("ADC="); Serial.print(adc, DEC);
+    Serial.print(" "); Serial.print(g_State.vbatValue, DEC); Serial.println("V");
 #endif // APIN_VBAT
 }
 
@@ -409,6 +467,7 @@ static void setupGpio()
 void setup()
 {
     Serial.begin(115200);
+    Serial.println("Starting CRServoF");
 
     setupGpio();
     setupCrsf();
@@ -416,6 +475,7 @@ void setup()
 
 void loop()
 {
+    // Serial.println("CRSF loop");
     crsf.loop();
     checkVbatt();
     checkSerialIn();
